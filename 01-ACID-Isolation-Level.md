@@ -327,7 +327,6 @@ Trước khi đọc/ghi, transaction phải acquire lock (shared lock cho read, 
   
   ```
   Khóa trước Làm việc sau
-  
   ```
 
 - Contention là sự tranh giành: vd 100 request cùng update vào 1 bản ghi thì request 1 update xong giữ lock các request sau sẽ phải đợi, đây gọi là Lock Contention
@@ -339,8 +338,6 @@ Trước khi đọc/ghi, transaction phải acquire lock (shared lock cho read, 
 Mỗi row có nhiều **version**. Khi update, không ghi đè mà tạo version mới với transaction ID. Reader đọc version "nhìn thấy được" theo snapshot của mình → **reader không block writer, writer không block reader**.
 
 PostgreSQL và MySQL InnoDB đều dùng MVCC. Đó là lý do PostgreSQL có `VACUUM` (dọn version cũ), MySQL có `undo log`.
-
-
 
 > ## Tóm tắt cực dễ nhớ
 > 
@@ -375,13 +372,11 @@ COMMIT;
 
 Dùng khi cần đảm bảo không ai đụng vào row này cho đến khi mình commit. Cẩn thận **deadlock** nếu lock nhiều row theo thứ tự khác nhau.
 
-
-
 - Pessimistic Lock là Tôi không tin transaction khác.
 
 - Nếu không dùng Pessimistic Lock (select for update) vd: Tài khoản A có 1000, transaction 1 select tài khoản A có bao nhiêu tiền sau đó muốn trừ đi 300, transaction 2 chạy cùng lúc cũng đọc được tài khoản A còn 1000 rồi lại muốn trừ 500, kết quả T1 update 700, T2 update lại còn 500 và số dư cuối cùng là còn 500 lẽ ra phải là 200.
 
--  Còn nếu dùng Pessimistic Lock (select for update) thì Transaction 1 đọc tài khoản còn bao nhiêu và sẽ lock lại rồi đi update lại số tiền bị trừ, xong transaction 1 commit thì lúc này mới chạy tiếp Transaction 2, đọc tk còn 700 và trừ đi 500 và kết quả cuối cùng còn 200, đúng.
+- Còn nếu dùng Pessimistic Lock (select for update) thì Transaction 1 đọc tài khoản còn bao nhiêu và sẽ lock lại rồi đi update lại số tiền bị trừ, xong transaction 1 commit thì lúc này mới chạy tiếp Transaction 2, đọc tk còn 700 và trừ đi 500 và kết quả cuối cùng còn 200, đúng.
 
 ### Optimistic Lock — version column
 
@@ -399,7 +394,9 @@ Nếu affected rows = 0 → ai đó đã update trước → retry hoặc báo l
 
 - UPDATE account
   SET balance = 700,
+  
       version = version + 1
+  
   WHERE id = 1
     AND version = 5;    bị  sai => update không thành công
 
@@ -533,8 +530,11 @@ Spring AOP hoạt động bằng **Proxy Pattern**.
   @Transactional không hoạt động
 
 - 
+
 - 
+
 - 
+
 - Cách khắc phục:
   
   Cách 1: Tách class (khuyến nghị)
@@ -557,8 +557,6 @@ Spring AOP hoạt động bằng **Proxy Pattern**.
       }
   
   }
-  
-  
 
 ### Bẫy 2: Long transaction
 
