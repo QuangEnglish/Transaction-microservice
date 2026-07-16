@@ -39,193 +39,391 @@ Tất cả 4 thao tác phải **all-or-nothing**: hoặc cả 4 thành công, ho
 
 ## 2. Two-Phase Commit (2PC)
 
-Giao thức kinh điển, do Jim Gray đề xuất 1978. Là nền tảng của chuẩn **XA (X/Open XA)**.
+Two-Phase Commit (2PC) là một giao thức giúp **nhiều database hoặc nhiều service cùng thực hiện một transaction**.
 
-### 2.1. Các vai trò
+Ý tưởng của nó rất đơn giản:
 
-- **Transaction Coordinator (TC):** điều phối viên trung tâm
-- **Participants (RM - Resource Managers):** các DB/service tham gia transaction
+> **Hoặc tất cả cùng thành công, hoặc tất cả cùng thất bại. Không được phép có chuyện nơi này commit còn nơi khác rollback.**
 
-### 2.2. Hai phase
-
-**Phase 1: PREPARE (Voting)**
-
-1. TC gửi `PREPARE` đến tất cả participants
-2. Mỗi participant:
-   - Thực hiện thao tác local (UPDATE, INSERT...) nhưng **chưa commit**
-   - Ghi vào WAL (write-ahead log) trạng thái "prepared"
-   - Lock các row liên quan
-   - Trả lời `YES` (sẵn sàng commit) hoặc `NO` (không thể)
-3. TC chờ tất cả vote
-
-**Phase 2: COMMIT / ABORT (Decision)**
-
-- Nếu **tất cả** vote `YES` → TC gửi `COMMIT` đến tất cả
-- Nếu **bất kỳ** vote `NO` (hoặc timeout) → TC gửi `ABORT` đến tất cả
-- Participants thực hiện commit/rollback local và ack lại TC
-
-### 2.3. Ví dụ minh họa
-
-```
-                  TC                  RM1               RM2
-                   |                    |                 |
-   Phase 1:        |---- PREPARE ------>|                 |
-                   |---- PREPARE -------|---------------->|
-                   |<-- YES ------------|                 |
-                   |<-- YES ----------------------------- |
-                   |                    |                 |
-   Phase 2:        |---- COMMIT ------->|                 |
-                   |---- COMMIT --------|---------------->|
-                   |<-- ACK ------------|                 |
-                   |<-- ACK ----------------------------- |
-                   |                    |                 |
-                  Done.
-```
-
-### 2.4. Đặc tính
-
-- **Atomicity:** đảm bảo
-- **Consistency:** đảm bảo (nếu tất cả RM đều ACID)
-- **Isolation:** đảm bảo (lock được giữ trong suốt 2 phase)
-- **Durability:** đảm bảo (mỗi RM tự đảm bảo)
-
-→ Nhìn có vẻ hoàn hảo. Vậy vấn đề ở đâu?
+Giao thức này được **Jim Gray** đề xuất vào năm **1978** và sau này trở thành nền tảng của chuẩn **XA Transaction**.
 
 ---
 
-## 3. Vì sao 2PC thất bại trong thực tế
+#### 2.1. Thành phần tham gia
 
-### 3.1. Blocking khi Coordinator chết
+Trong 2PC có 2 vai trò chính.
 
-Đây là vấn đề **trí mạng** nhất.
+##### 1. Transaction Coordinator (TC)
 
-Kịch bản: TC đã nhận `YES` từ tất cả, đang chuẩn bị gửi `COMMIT` thì **TC crash**.
+Đây là **người điều phối**.
 
-Các RM đang ở trạng thái "prepared":
+Nó không trực tiếp sửa dữ liệu mà chỉ có nhiệm vụ:
 
-- Đã lock data
-- Đã ghi WAL "prepared"
-- **Không biết** kết quả cuối: commit hay abort?
-- → **Không thể quyết định một mình**, vì có thể TC đã gửi COMMIT cho RM khác rồi
-- → **Block vĩnh viễn**, giữ lock vô thời hạn
+- hỏi mọi người đã sẵn sàng chưa,
+- quyết định commit hay rollback,
+- rồi thông báo quyết định đó cho tất cả.
 
-Đây gọi là **"in-doubt transaction"**. Trong production XA, đây là cơn ác mộng của DBA.
+Có thể hình dung Coordinator giống như **trọng tài** của trận đấu.
 
-### 3.2. Synchronous & Slow
+---
 
-- Mọi RM phải **chờ nhau**
-- 2 round-trip network giữa TC và mỗi RM
-- Latency = max(latency của RM chậm nhất) × 2
-- Trong khi đó, **toàn bộ data đều bị lock**
-- → Throughput thấp, contention cao
+##### 2. Resource Manager (RM)
 
-### 3.3. Tight Coupling
+Đây là các database hoặc service tham gia transaction.
 
-- Tất cả RM phải online cùng lúc
-- Tất cả phải support XA protocol
-- Một RM yếu = cả transaction yếu
-- → **Vi phạm triết lý microservices** (loose coupling, independent deployment)
+Ví dụ:
 
-### 3.4. Không support nhiều resource hiện đại
+- Database của Order
+- Database của Inventory
+- Database của Payment
 
-XA hỗ trợ tốt cho RDBMS truyền thống. Nhưng:
+Mỗi RM chỉ chịu trách nhiệm xử lý dữ liệu của chính mình.
 
-- **Kafka**: không hỗ trợ XA chuẩn (có "exactly-once" nhưng cơ chế khác)
-- **MongoDB, Cassandra, Redis**: không hỗ trợ XA
-- **REST API**: hoàn toàn không có khái niệm prepare/commit
-- **gRPC**: tương tự
+---
 
-→ Trong stack microservices điển hình (Spring Boot + Kafka + PostgreSQL + Redis), 2PC **không thể áp dụng**.
+#### 2.2. Hai giai đoạn của 2PC
 
-### 3.5. Khả năng mở rộng kém
+Đúng như tên gọi **Two-Phase Commit**, giao thức gồm **2 bước**.
 
-- Càng nhiều RM → xác suất 1 RM fail càng cao → transaction càng dễ abort
-- Với N participants, xác suất thành công ≈ (p)^N với p = xác suất 1 RM OK
-- → 2PC chỉ thực tế khi N nhỏ (2-3)
+---
 
-### 3.6. Heuristic decisions = nightmare
+##### Giai đoạn 1: PREPARE (Chuẩn bị)
 
-Khi RM bị block quá lâu chờ TC, DBA có thể "heuristic commit" hoặc "heuristic abort" thủ công. Nhưng nếu quyết định sai (so với quyết định cuối cùng của TC), bạn có **inconsistent state** mà DBMS không phát hiện được.
+Coordinator sẽ đi hỏi từng participant:
+
+> **"Bạn đã sẵn sàng commit chưa?"**
+
+Lúc này mỗi RM sẽ:
+
+- thực hiện UPDATE hoặc INSERT,
+- **chưa commit ngay**,
+- ghi thông tin transaction vào **WAL (Write-Ahead Log)** để nếu hệ thống bị crash vẫn biết mình đang ở trạng thái nào,
+- khóa (lock) các dòng dữ liệu liên quan,
+- sau đó trả lời:
+
+```
+YES  -> Tôi đã sẵn sàng commit.
+```
+
+hoặc
+
+```
+NO -> Tôi không thể commit.
+```
+
+Coordinator sẽ **đợi tất cả RM phản hồi** trước khi quyết định bước tiếp theo.
+
+---
+
+##### Giai đoạn 2: COMMIT hoặc ABORT
+
+Sau khi nhận đủ phản hồi, Coordinator sẽ đưa ra quyết định cuối cùng.
+
+##### Trường hợp 1: Tất cả đều trả lời YES
+
+Coordinator gửi lệnh:
+
+```
+COMMIT
+```
+
+đến tất cả RM.
+
+Lúc này mỗi RM sẽ:
+
+- commit transaction,
+- ghi dữ liệu xuống database,
+- giải phóng lock,
+- gửi ACK để xác nhận đã hoàn thành.
+
+---
+
+##### Trường hợp 2: Chỉ cần một RM trả lời NO
+
+Ví dụ:
+
+```
+RM1 -> YESRM2 -> NORM3 -> YES
+```
+
+Coordinator sẽ lập tức gửi:
+
+```
+ABORT
+```
+
+cho tất cả.
+
+Kết quả:
+
+- RM1 rollback
+- RM2 rollback
+- RM3 rollback
+
+Không có bất kỳ database nào được phép commit.
+
+Đó chính là nguyên tắc:
+
+> **Hoặc tất cả cùng thành công, hoặc tất cả cùng thất bại.**
+
+---
+
+#### 2.4. Vì sao 2PC đảm bảo ACID?
+
+##### 1. Atomicity (Tính nguyên tử)
+
+Được đảm bảo rất tốt.
+
+Hoặc tất cả cùng commit.
+
+Hoặc tất cả cùng rollback.
+
+Không tồn tại trạng thái "database này thành công nhưng database kia thất bại".
+
+---
+
+##### 2. Consistency (Tính nhất quán)
+
+Nếu tất cả Resource Manager đều tuân thủ ACID thì sau transaction, dữ liệu trên toàn hệ thống vẫn nhất quán.
+
+---
+
+##### 3. Isolation (Tính cô lập)
+
+Trong suốt thời gian chờ Coordinator quyết định, các RM **vẫn giữ lock** trên dữ liệu.
+
+Điều này giúp transaction khác không thể sửa cùng dữ liệu, tránh xung đột.
+
+---
+
+##### 4. Durability (Tính bền vững)
+
+Trước khi trả lời `YES`, mỗi RM đều ghi transaction vào **Write-Ahead Log (WAL)**.
+
+Nhờ vậy, nếu hệ thống bị mất điện hoặc crash, RM vẫn có thể khôi phục trạng thái và tiếp tục xử lý sau khi khởi động lại.
+
+
+
+**Vậy tại sao các hệ thống microservices hiện đại như Amazon, Netflix hay Uber lại gần như không sử dụng 2PC?**
+
+#### 3. Vì sao 2PC thất bại trong thực tế
+
+##### Nhìn qua, 2PC gần như hoàn hảo. Tuy nhiên khi triển khai trên hệ thống lớn, nó gặp rất nhiều hạn chế.
+
+##### 3.1. Coordinator bị chết (Blocking)
+
+Đây là nhược điểm lớn nhất.
+
+Giả sử tất cả Resource Manager (RM) đều đã trả lời **YES**, nhưng trước khi gửi lệnh **COMMIT**, Coordinator lại bị crash.
+
+Lúc này các RM:
+
+- Đã cập nhật dữ liệu nhưng chưa commit.
+- Đang giữ lock trên dữ liệu.
+- Không biết nên **commit hay rollback**.
+- Không thể tự quyết định vì có thể Coordinator đã gửi COMMIT cho RM khác.
+
+→ Kết quả là transaction bị **kẹt (blocking)** và lock có thể bị giữ rất lâu.
+
+---
+
+##### 3.2. Chậm vì phải chờ nhau
+
+Trong 2PC:
+
+- Tất cả RM phải phản hồi trước khi tiếp tục.
+- Coordinator phải trao đổi với mỗi RM qua **2 lần giao tiếp** (Prepare và Commit).
+- Trong lúc chờ, dữ liệu vẫn bị lock.
+
+→ Chỉ cần một RM chậm là cả transaction chậm theo.
+
+---
+
+##### 3.3. Các service phụ thuộc nhau
+
+2PC yêu cầu:
+
+- Tất cả service phải đang hoạt động.
+- Tất cả đều phải hỗ trợ giao thức XA.
+- Một service gặp sự cố có thể làm cả transaction thất bại.
+
+→ Điều này đi ngược với mục tiêu của **Microservices**, nơi mỗi service nên hoạt động độc lập.
+
+---
+
+##### 3.4. Không hỗ trợ nhiều công nghệ hiện đại
+
+2PC hoạt động tốt với các database quan hệ như Oracle hay PostgreSQL.
+
+Nhưng nhiều thành phần phổ biến trong Microservices lại không hỗ trợ XA, ví dụ:
+
+- Kafka
+- Redis
+- MongoDB
+- REST API
+- gRPC
+
+→ Vì vậy rất khó áp dụng 2PC cho một hệ thống Microservices hiện đại.
+
+---
+
+##### 3.5. Khó mở rộng
+
+Càng nhiều RM tham gia thì khả năng có một RM gặp lỗi càng cao.
+
+Ví dụ:
+
+- 2 RM → khá dễ thành công.
+- 10 RM → chỉ cần 1 RM lỗi là cả transaction phải rollback.
+
+→ Hệ thống càng lớn thì 2PC càng kém hiệu quả.
+
+---
+
+##### 3.6. Khó xử lý khi bị kẹt
+
+Nếu transaction bị block quá lâu, quản trị viên đôi khi phải **tự quyết định** commit hoặc rollback.
+
+Nếu quyết định sai, dữ liệu giữa các hệ thống có thể bị **không nhất quán**, và việc khôi phục sẽ rất phức tạp.
+
+---
+
+##### Kết luận
+
+Nhược điểm lớn nhất của 2PC là:
+
+- ❌ Dễ bị block nếu Coordinator gặp sự cố.
+- ❌ Chậm vì mọi service phải chờ nhau.
+- ❌ Các service phụ thuộc chặt chẽ vào nhau.
+- ❌ Khó áp dụng với Kafka, Redis, REST API...
+- ❌ Khả năng mở rộng kém.
+
+Chính vì vậy, đa số hệ thống **Microservices hiện đại** không sử dụng 2PC mà chuyển sang các mô hình như **Saga Pattern**, **Event-Driven Architecture** và **Eventual Consistency**.
 
 ---
 
 ## 4. Three-Phase Commit (3PC)
 
-Sinh ra để **giải quyết blocking** của 2PC.
+3PC ra đời để **khắc phục nhược điểm bị block của 2PC**.
 
-### 4.1. Ý tưởng
+#### 4.1. Ý tưởng
 
-Thêm 1 phase trung gian gọi là **PRE-COMMIT** giữa PREPARE và COMMIT.
+Thay vì chỉ có **2 bước**, 3PC thêm một bước ở giữa gọi là **PRE-COMMIT**.
 
-- Phase 1: **CAN-COMMIT?** (vote)
-- Phase 2: **PRE-COMMIT** (nói "sắp commit rồi đấy")
-- Phase 3: **DO-COMMIT** (commit thật)
+Quy trình gồm 3 giai đoạn:
 
-Nếu TC chết giữa chừng, các RM có thể **timeout và tự quyết định** dựa trên trạng thái phase đang ở:
+1. **CAN-COMMIT?** → Hỏi các RM có sẵn sàng không.
+2. **PRE-COMMIT** → Thông báo: *"Mọi thứ đã ổn, chuẩn bị commit."*
+3. **DO-COMMIT** → Thực hiện commit thật.
 
-- Đang ở phase 1 → tự abort (an toàn)
-- Đang ở phase 2 (đã PRE-COMMIT) → tự commit (vì biết các RM khác cũng đã ACK pre-commit)
+Điểm khác biệt là nếu **Coordinator bị crash**, các RM có thể **chờ một khoảng thời gian rồi tự quyết định**:
 
-### 4.2. Vì sao 3PC vẫn ít dùng
+- Đang ở **CAN-COMMIT** → tự **Rollback**.
+- Đang ở **PRE-COMMIT** → tự **Commit**.
 
-- **Giả định mạng không phân vùng**: 3PC hoạt động đúng chỉ khi không có network partition. Có partition → có thể inconsistent (vi phạm CAP).
-- **Thêm 1 round-trip**: chậm hơn 2PC thêm ~50%
-- **Phức tạp hơn nhiều**: code khó viết đúng, khó test
-- **Implementation thực tế hiếm**: hầu hết DB không hỗ trợ 3PC sẵn
+→ Nhờ đó giảm được tình trạng transaction bị kẹt như trong 2PC.
 
-→ 3PC chủ yếu là kiến thức **lý thuyết**. Production hầu như không ai dùng.
+---
+
+#### 4.2. Vì sao 3PC vẫn ít được sử dụng?
+
+Mặc dù cải thiện được 2PC, nhưng 3PC vẫn có nhiều hạn chế:
+
+- Phải **trao đổi thêm 1 bước**, nên chậm hơn 2PC.
+- Hoạt động tốt khi **mạng ổn định**, nếu xảy ra **network partition** vẫn có thể làm dữ liệu không nhất quán.
+- Cài đặt phức tạp và khó kiểm thử.
+- Hầu hết database hiện nay **không hỗ trợ 3PC**.
+
+---
+
+#### Kết luận
+
+3PC giải quyết được một phần vấn đề **blocking** của 2PC, nhưng đổi lại hệ thống trở nên **phức tạp và chậm hơn**.
 
 ---
 
 ## 5. XA Protocol & JTA — 2PC trong Java
 
-### 5.1. XA là gì
+#### 5.1. XA là gì?
 
-XA = chuẩn của X/Open Group để chuẩn hoá interface giữa TC và RM. Định nghĩa các function: `xa_start`, `xa_prepare`, `xa_commit`, `xa_rollback`, `xa_recover`...
+**XA** là một chuẩn giúp nhiều database hoặc nhiều hệ thống **tham gia cùng một transaction**.
 
-### 5.2. JTA (Java Transaction API)
+Nó định nghĩa cách **Coordinator** giao tiếp với các **Resource Manager**, ví dụ:
 
-Đặc tả Java cho distributed transaction. API chính: `UserTransaction`, `TransactionManager`.
+- Bắt đầu transaction.
+- Chuẩn bị commit.
+- Commit.
+- Rollback.
+- Khôi phục khi có sự cố.
 
-### 5.3. Implementations phổ biến
+Có thể hiểu đơn giản:
 
-- **Atomikos**, **Bitronix**, **Narayana** (JBoss): JTA standalone
-- **WebLogic, WebSphere**: built-in JTA
-- **Spring** có thể dùng JTA qua `JtaTransactionManager`
+> **XA chính là "luật chơi" của giao thức 2PC.**
 
-### 5.4. Code mẫu Spring + JTA
+---
 
-```java
-@Configuration
-public class JtaConfig {
-    @Bean
-    public JtaTransactionManager transactionManager() {
-        return new JtaTransactionManager();
-    }
-}
+#### 5.2. JTA là gì?
 
-@Service
-public class TransferService {
-    @Autowired DataSource db1;
-    @Autowired DataSource db2;
+**JTA (Java Transaction API)** là API của Java dùng để làm việc với **distributed transaction**.
 
-    @Transactional  // JTA, xuyên DB
-    public void transfer(Long from, Long to, BigDecimal amount) {
-        // UPDATE trên db1 và db2 — JTA đảm bảo atomic
-    }
+Thay vì tự viết logic 2PC, lập trình viên chỉ cần đánh dấu:
+
+```
+@Transactional
+```
+
+Phần còn lại sẽ do JTA xử lý.
+
+---
+
+#### 5.3. Một số framework phổ biến
+
+Java có nhiều thư viện hỗ trợ JTA như:
+
+- Atomikos
+- Bitronix
+- Narayana (JBoss)
+
+Ngoài ra, Spring cũng hỗ trợ thông qua **JtaTransactionManager**.
+
+---
+
+#### 5.4. Ví dụ trong Spring
+
+```
+@Transactional
+public void transfer(...) {    // Cập nhật DB1
+    // Cập nhật DB2
 }
 ```
 
-→ **Code thì đẹp**, nhưng đằng sau là 2PC với tất cả nhược điểm đã liệt kê.
+Nhìn vào code thì rất đơn giản.
 
-### 5.5. Khi nào còn nên dùng XA/JTA?
+Nhưng bên dưới, JTA vẫn đang sử dụng **Two-Phase Commit (2PC)** để đảm bảo cả hai database cùng **commit hoặc rollback**.
 
-- **Monolith** với 2-3 database nội bộ
-- **Legacy system** (banking core)
-- Khi cả stack đều support XA và **không có** message broker / NoSQL
-- Khi business **bắt buộc** strong consistency và không thể design lại
+---
 
-→ Trong stack microservices hiện đại: **gần như không bao giờ**.
+#### 5.5. Khi nào nên dùng XA/JTA?
+
+XA/JTA vẫn phù hợp nếu:
+
+- Ứng dụng **Monolith**.
+- Chỉ có **2–3 database** nội bộ.
+- Toàn bộ hệ thống đều hỗ trợ XA.
+- Doanh nghiệp bắt buộc phải có **Strong Consistency**.
+
+---
+
+#### Kết luận
+
+XA và JTA giúp việc lập trình **đơn giản hơn**, nhưng **không loại bỏ được các nhược điểm của 2PC** như:
+
+- Dễ bị block.
+- Hiệu năng thấp.
+- Khó mở rộng.
+- Không phù hợp với Kafka, Redis, NoSQL hay kiến trúc Microservices.
+
+Vì vậy, trong các hệ thống **Microservices hiện đại**, **XA/JTA rất hiếm khi được sử dụng**; thay vào đó người ta ưu tiên **Saga Pattern** và **Event-Driven Architecture**.
 
 ---
 
@@ -248,67 +446,135 @@ public class TransferService {
 
 ## 7. Tại sao industry chuyển sang Saga
 
-Tóm gọn lý do industry (Netflix, Amazon, Uber, Microsoft...) đã bỏ 2PC để dùng Saga:
+Sau nhiều năm sử dụng 2PC, các công ty như **Netflix, Amazon, Uber, Microsoft...** dần chuyển sang **Saga Pattern** vì phù hợp hơn với kiến trúc Microservices.
 
-1. **Microservices cần independent deployment** — 2PC tight-couple chúng lại
-2. **Kafka, NoSQL, REST không hỗ trợ XA**
-3. **Latency phải thấp** — 2PC quá chậm
-4. **Availability quan trọng hơn consistency tức thời** — chấp nhận eventual
-5. **Scale phải lên 1000+ service** — 2PC không scale
-6. **Compensating logic** (rollback bằng business action) phù hợp với business domain hơn
+#### 1. Microservices cần hoạt động độc lập
 
-→ Triết lý mới: **"Đừng chống lại tự nhiên của distributed system. Thiết kế hệ thống để chịu được sự không nhất quán tạm thời, rồi đảm bảo cuối cùng nhất quán."**
+2PC yêu cầu tất cả service cùng tham gia một transaction, khiến chúng phụ thuộc lẫn nhau.
 
-Đó chính là Saga.
+Saga cho phép mỗi service xử lý độc lập và giao tiếp qua event.
+
+---
+
+#### 2. Không phải công nghệ nào cũng hỗ trợ 2PC
+
+Hệ thống hiện đại thường dùng:
+
+- Kafka
+- Redis
+- MongoDB
+- REST API
+
+Phần lớn đều **không hỗ trợ XA**, nên rất khó áp dụng 2PC.
+
+---
+
+#### 3. Hiệu năng tốt hơn
+
+2PC bắt các service phải chờ nhau và giữ lock trong suốt transaction.
+
+Saga không cần lock toàn hệ thống nên xử lý nhanh và dễ mở rộng hơn.
+
+---
+
+#### 4. Chấp nhận Eventual Consistency
+
+Thay vì yêu cầu dữ liệu phải nhất quán ngay lập tức, Saga chấp nhận dữ liệu **không nhất quán trong thời gian ngắn** và sẽ đồng bộ sau.
+
+---
+
+#### 5. Rollback theo nghiệp vụ
+
+Khi có lỗi:
+
+- **2PC:** Rollback transaction.
+- **Saga:** Thực hiện **Compensating Action** (ví dụ: hủy đơn hàng, hoàn kho, hoàn tiền).
+
+Điều này phù hợp với các bài toán nghiệp vụ thực tế hơn.
 
 ---
 
 ## 8. Outbox & CDC — preview vai trò
 
-Có một vấn đề con quan trọng: **làm sao "ghi DB + publish event" atomic?**
+Sau khi bỏ 2PC, một câu hỏi mới xuất hiện:
 
-Ví dụ: OrderService cần
+> **Làm sao vừa ghi dữ liệu vào Database, vừa gửi Event lên Kafka mà không bị lệch dữ liệu?**
+
+Ví dụ, khi tạo đơn hàng:
 
 ```
-1. INSERT INTO orders ...
-2. Publish event "OrderCreated" to Kafka
+1. Lưu Order vào Database.2. Publish sự kiện OrderCreated lên Kafka.
 ```
 
-Nếu (1) OK mà (2) fail → DB có order nhưng event không phát → các service khác không biết → inconsistency.
-Nếu (2) OK mà (1) fail → đã publish event nhưng DB không có → ma luôn.
+Nếu:
 
-→ Đây gọi là **Dual Write Problem**.
-→ 2PC giữa DB và Kafka → không có (Kafka không support XA chuẩn).
-→ Giải pháp: **Outbox Pattern** (ghi event vào cùng DB như 1 transaction, rồi 1 process khác đọc và publish). Đây là bài học sau.
+- Database lưu thành công nhưng **publish Event thất bại** → các service khác không biết có đơn hàng mới.
+- Publish Event thành công nhưng **Database lưu thất bại** → các service nhận được một sự kiện không tồn tại.
+
+→ Đây được gọi là **Dual Write Problem**.
+
+Vì **Kafka không hỗ trợ XA/2PC**, nên không thể dùng transaction để đảm bảo cả hai bước luôn thành công cùng lúc.
+
+#### Giải pháp
+
+Thay vì ghi vào **Database** và **Kafka** cùng lúc, ta sẽ:
+
+- Ghi dữ liệu và Event vào **cùng một Database trong một transaction**.
+- Sau đó, một tiến trình khác sẽ đọc Event và gửi lên Kafka.
+
+Đó chính là **Outbox Pattern**, kết hợp với **CDC (Change Data Capture)** để đồng bộ dữ liệu một cách an toàn.
 
 ---
 
 ## 9. Bẫy phổ biến
 
-### Bẫy 1: "Microservice của tôi nhỏ, dùng 2PC cho nhanh"
+#### Bẫy 1: "Microservice nhỏ thì dùng 2PC cho nhanh"
 
-Không. Một khi đã chia service, đừng kéo 2PC vào. Code design dựa vào 2PC sẽ rất khó migrate sau này.
+Đừng làm vậy.
 
-### Bẫy 2: Lẫn lộn @Transactional với distributed transaction
+Một khi đã chọn **Microservices**, hãy tránh phụ thuộc vào 2PC. Sau này mở rộng hoặc tách service sẽ rất khó.
 
-`@Transactional` của Spring (mặc định) chỉ là **local transaction trên 1 DataSource**. Không phải distributed. Muốn distributed phải config `JtaTransactionManager`.
+---
 
-### Bẫy 3: Tưởng Kafka transaction = XA transaction
+#### Bẫy 2: Nhầm `@Transactional` là Distributed Transaction
 
-Kafka có **transactional producer** (`transactional.id`, `initTransactions()`, `beginTransaction()`, `commitTransaction()`), nhưng đây là transaction **trong phạm vi Kafka** (multiple topics/partitions), KHÔNG phải XA với DB.
+`@Transactional` mặc định của Spring chỉ quản lý **transaction trên một Database**.
 
-### Bẫy 4: Tưởng "Saga = thay thế hoàn toàn 2PC"
+Muốn transaction giữa nhiều Database phải cấu hình **JTA/XA**.
 
-Sai. Saga chỉ đảm bảo **eventual consistency** + **compensation**, KHÔNG đảm bảo isolation. Sẽ có giai đoạn "đang giữa flow" mà data ở các service inconsistent.
-→ Cần design business logic và UI/UX cho phù hợp.
+---
 
-### Bẫy 5: Nghĩ rằng "không dùng XA = không cần học XA"
+#### Bẫy 3: Nhầm Kafka Transaction với XA
 
-Senior/Architect cần hiểu XA để:
+Kafka có **Transaction**, nhưng chỉ đảm bảo dữ liệu **bên trong Kafka**.
 
-- Maintain legacy
-- Tranh luận trade-off
-- Hiểu sâu vì sao Saga ra đời
+Nó **không thể** đảm bảo transaction giữa **Database và Kafka** như XA.
+
+---
+
+#### Bẫy 4: Nghĩ Saga thay thế hoàn toàn 2PC
+
+Saga **không đảm bảo Strong Consistency**.
+
+Nó chỉ đảm bảo **Eventual Consistency**, nên sẽ có lúc dữ liệu giữa các service chưa đồng bộ.
+
+→ Business và UI cần được thiết kế để chấp nhận điều này.
+
+---
+
+#### Bẫy 5: Không dùng XA thì không cần học XA
+
+Dù ít dùng trong hệ thống mới, XA vẫn rất quan trọng để:
+
+- Hiểu các hệ thống cũ (Legacy).
+- So sánh ưu, nhược điểm với Saga.
+- Hiểu vì sao ngành phần mềm chuyển từ **2PC** sang **Saga Pattern**.
+
+---
+
+#### Kết luận
+
+Hiểu **XA và 2PC** không phải để dùng trong mọi dự án, mà để biết **khi nào nên dùng và khi nào không nên dùng**, từ đó lựa chọn kiến trúc phù hợp cho từng bài toán.
 
 ---
 

@@ -13,351 +13,599 @@
 
 ---
 
-## 1. Saga là gì
+### 1. Saga là gì?
 
-### 1.1. Định nghĩa
+## 1.1. Định nghĩa
 
-> **Saga = một chuỗi các local transaction**, mỗi transaction cập nhật 1 service. Nếu một bước fail, Saga thực hiện **các compensating transaction** để undo các bước trước đó.
+> **Saga** là một cách xử lý giao dịch trong **microservices**, trong đó **mỗi service chỉ thực hiện transaction của chính mình**. Nếu một bước gặp lỗi, hệ thống sẽ **thực hiện các transaction bù (Compensating Transaction)** để đưa toàn bộ quy trình về trạng thái hợp lý.
 
-Khái niệm gốc từ paper **"Sagas"** của Hector Garcia-Molina & Kenneth Salem (1987), ban đầu dành cho long-lived transaction trong 1 DB. Sau này được áp dụng vào microservices.
+Saga được giới thiệu lần đầu trong bài báo **"Sagas"** của Hector Garcia-Molina và Kenneth Salem (1987). Ban đầu nó được dùng cho các transaction kéo dài trong một cơ sở dữ liệu, nhưng ngày nay lại trở thành giải pháp phổ biến cho kiến trúc microservices.
 
-### 1.2. Ý tưởng cốt lõi
+---
 
-Thay vì giữ lock toàn flow (như 2PC):
-1. Mỗi service thực hiện **local transaction ACID** của riêng nó → commit ngay
-2. Sau khi commit, **publish event/command** để bước tiếp theo bắt đầu
-3. Nếu bước nào fail → **trigger compensating transaction** ngược về trước
+## 1.2. Ý tưởng cốt lõi
 
-→ Đánh đổi:
-- **Mất:** Isolation (giai đoạn giữa flow có thể đọc inconsistent)
-- **Mất:** Atomicity strict (không phải all-or-nothing tức thì)
-- **Được:** Availability, scalability, loose coupling
+Ở bài trước chúng ta đã thấy **2PC** cố gắng làm cho tất cả service **commit hoặc rollback cùng lúc**. Điều này giúp dữ liệu luôn nhất quán nhưng phải giữ lock lâu, hiệu năng giảm và khó mở rộng.
 
-### 1.3. Compensating Transaction — Khái niệm cốt lõi
+**Saga đi theo hướng hoàn toàn khác.**
 
-> **Compensating transaction** = một transaction **mới** thực hiện hành động **semantically undo** một transaction trước đó.
+Thay vì đợi tất cả service hoàn thành rồi mới commit:
 
-Lưu ý: KHÔNG phải rollback.
-- **Rollback** (ACID): xoá vết, như chưa từng có
-- **Compensation**: thêm 1 transaction ngược lại, **để lại lịch sử**
+1. Mỗi service xử lý **local transaction** của mình.
+2. Nếu thành công thì **commit ngay**, không chờ service khác.
+3. Sau khi commit, service gửi **Event** hoặc **Command** để kích hoạt bước tiếp theo.
+4. Nếu một bước phía sau thất bại, hệ thống sẽ chạy **Compensating Transaction** để bù lại những gì các bước trước đã làm.
 
-#### Ví dụ ngân hàng
+Có thể hình dung như sau:
+
 ```
-T1: Trừ 100 từ A → A: 900 (đã commit)
-T2: Cộng 100 vào B → fail!
-C1: Cộng 100 lại vào A → A: 1000
+Order Service      │      ▼Commit Order      │ Publish Event      │      ▼Inventory Service      │ Commit Inventory      │ Publish Event      │      ▼Payment Service      │      ✖ Fail      │      ▼Compensating Transaction      │Khôi phục Inventory      │Khôi phục Order
 ```
-Trong audit log: có 3 transaction (trừ, cộng fail, cộng bù). Không phải "như chưa từng có".
 
-#### Đặc tính bắt buộc của Compensating Transaction
-- **Idempotent**: chạy nhiều lần kết quả như 1 lần (sẽ học kỹ ở bài 6)
-- **Commutative** (tốt nhất): thứ tự không ảnh hưởng
-- **Semantically correct**: phản ánh đúng business intent
-- **Không cần thiết phải hoàn nguyên 100% trạng thái cũ** (impossible với một số case, ví dụ "email đã gửi đi rồi")
+Điểm khác biệt lớn nhất là:
 
-#### Compensation không phải lúc nào cũng làm được
-- Email đã gửi → không thể "ungửi". Phải gửi email apology.
-- Payment đã capture → có thể refund (compensation), nhưng có phí
-- Inventory đã ship → recall vật lý, không có "undo" trong code
+- **2PC:** Chưa ai commit cho đến khi tất cả đều sẵn sàng.
+- **Saga:** Mỗi service commit ngay khi hoàn thành phần việc của mình.
 
-→ Senior phải design business flow để **compensation luôn khả thi**.
+---
+
+## 1.3. Saga đánh đổi điều gì?
+
+Không có mô hình nào hoàn hảo, Saga cũng vậy.
+
+Bạn sẽ **đánh đổi một số tính chất của ACID** để đổi lấy khả năng mở rộng.
+
+### Mất
+
+- **Isolation**: Trong lúc Saga đang chạy, các service khác có thể nhìn thấy dữ liệu ở trạng thái "đang xử lý", chưa hoàn chỉnh.
+- **Atomicity tuyệt đối**: Không còn kiểu "thành công tất cả hoặc rollback tất cả ngay lập tức".
+
+### Được
+
+- **Availability cao hơn**: Mỗi service hoạt động độc lập, không phải chờ nhau.
+- **Scalability tốt hơn**: Không giữ lock lâu như 2PC.
+- **Loose Coupling**: Các service giao tiếp qua Event hoặc Command nên ít phụ thuộc lẫn nhau.
+
+Đây chính là lý do phần lớn hệ thống microservices hiện đại ưu tiên Saga thay vì Distributed Transaction.
+
+---
+
+# 1.4. Compensating Transaction – Trái tim của Saga
+
+Đây là khái niệm quan trọng nhất khi học Saga.
+
+> **Compensating Transaction** là **một transaction mới** được tạo ra để **bù lại tác động của một transaction trước đó** khi quy trình xảy ra lỗi.
+
+Điều quan trọng cần nhớ là:
+
+> **Compensation KHÔNG phải Rollback.**
+
+Đây là hai khái niệm hoàn toàn khác nhau.
+
+### Rollback (ACID)
+
+Rollback xảy ra khi transaction **chưa commit**.
+
+Khi rollback, mọi thay đổi đều bị xóa như chưa từng tồn tại.
+
+```
+Update Database        │Rollback        │Database trở về trạng thái ban đầu
+```
+
+Giống như bạn gõ một đoạn văn trong Word nhưng chưa lưu, sau đó nhấn **Undo**. Đoạn văn biến mất hoàn toàn.
+
+---
+
+### Compensation (Saga)
+
+Trong Saga, transaction trước **đã commit thành công**.
+
+Lúc này không thể rollback được nữa.
+
+Giải pháp là tạo **một transaction mới** để bù lại tác động trước đó.
+
+Ví dụ:
+
+```
+T1: Trừ 100.000đ từ tài khoản A   ✔ CommitT2: Cộng 100.000đ vào tài khoản B ✖ FailC1: Cộng lại 100.000đ vào A        ✔ Commit
+```
+
+Kết quả cuối cùng:
+
+```
+A: 1.000.000đB: Không thay đổi
+```
+
+Trong lịch sử giao dịch vẫn còn đầy đủ:
+
+```
+✔ Trừ tiền✖ Chuyển tiền thất bại✔ Cộng tiền hoàn lại
+```
+
+Không có giao dịch nào bị "xóa khỏi lịch sử". Hệ thống chỉ ghi thêm một giao dịch để cân bằng lại dữ liệu.
+
+---
+
+# 1.5. Một Compensating Transaction tốt cần có gì?
+
+Để Saga hoạt động ổn định, transaction bù thường cần các đặc điểm sau:
+
+### Idempotent
+
+Nếu vì lý do nào đó transaction bù bị chạy nhiều lần thì kết quả vẫn phải giống như chỉ chạy một lần.
+
+Ví dụ:
+
+```
+Refund Order #100
+```
+
+Dù message bị gửi lại 3 lần thì khách hàng cũng chỉ được hoàn tiền một lần.
+
+---
+
+### Semantically Correct
+
+Compensation phải phản ánh đúng ý nghĩa nghiệp vụ.
+
+Ví dụ:
+
+```
+Đặt hàng thất bại→ Trả lại tồn kho→ Hủy đơn hàng→ Hoàn tiền
+```
+
+Đó mới là cách "undo" đúng theo góc nhìn của business.
+
+---
+
+### Commutative (nếu có thể)
+
+Nếu các transaction bù có thể thực hiện theo nhiều thứ tự khác nhau mà kết quả vẫn đúng thì hệ thống sẽ dễ mở rộng và xử lý lỗi hơn.
+
+Đây là một đặc tính tốt nên có, nhưng không phải lúc nào cũng đạt được.
+
+---
+
+# 1.6. Không phải thứ gì cũng "undo" được
+
+Một hiểu lầm phổ biến là nghĩ rằng Compensation có thể đưa mọi thứ về trạng thái ban đầu.
+
+Thực tế thì **không phải lúc nào cũng làm được**.
+
+Ví dụ:
+
+### Gửi Email
+
+```
+Đã gửi email cho khách
+```
+
+Không có API nào có thể thu hồi email đã gửi.
+
+Giải pháp thường là:
+
+```
+Gửi thêm email xin lỗi
+```
+
+Đó chính là Compensation.
+
+---
+
+### Thanh toán
+
+```
+Đã trừ tiền khách hàng
+```
+
+Không thể "xóa" giao dịch khỏi ngân hàng.
+
+Giải pháp là:
+
+```
+Refund
+```
+
+Khách nhận lại tiền bằng **một giao dịch mới**.
+
+---
+
+### Giao hàng
+
+```
+Đơn hàng đã giao
+```
+
+Không thể gọi hàm:
+
+```
+undoShipping();
+```
+
+Giải pháp thực tế là:
+
+- Yêu cầu khách trả hàng.
+- Tạo phiếu hoàn hàng.
+- Hoàn tiền sau khi nhận lại sản phẩm.
+
+Đó đều là các **Compensating Transaction** ở mức nghiệp vụ.
 
 ---
 
 ## 2. Anatomy của một Saga
 
-### 2.1. Cấu trúc
+## 2.1. Một Saga gồm những gì?
 
-Một Saga gồm:
-- **Saga Definition**: chuỗi `T1 → T2 → T3 → ... → Tn` và compensation tương ứng `C1, C2, ..., Cn-1`
-- **Saga Execution Coordinator (SEC)**: ai điều phối các bước (centralized hoặc distributed)
-- **Saga Log**: ghi lại trạng thái từng bước (để recovery khi crash)
+Một Saga thường có **3 thành phần chính**:
 
-### 2.2. Forward Recovery vs Backward Recovery
+- **Saga Definition:** Quy định các bước cần thực hiện (T1 → T2 → T3...) và các bước bù tương ứng (C1, C2...).
+- **Saga Coordinator:** Thành phần điều phối, quyết định bước nào chạy tiếp hoặc khi nào cần bù.
+- **Saga Log:** Lưu trạng thái của từng bước để có thể khôi phục nếu hệ thống bị crash.
 
-**Backward Recovery (phổ biến hơn)**
-- Nếu Ti fail → chạy Ci-1, Ci-2, ..., C1 theo thứ tự ngược
-- Áp dụng khi có thể compensate
-- Ví dụ: payment fail → refund, release inventory, cancel order
-
-**Forward Recovery (Pure Saga)**
-- Nếu Ti fail → retry Ti cho đến khi thành công
-- Áp dụng khi **bắt buộc** phải đi đến cuối (ví dụ regulatory)
-- Cần có cơ chế retry và human escalation
-- Ví dụ: tax filing — phải nộp được, không có "không nộp"
-
-**Mixed**
-- Một số bước backward, một số bước forward
-- Thực tế thường gặp
-
-### 2.3. Saga States
-
-```
-PENDING → IN_PROGRESS → COMPLETED
-                ↓
-            FAILED → COMPENSATING → COMPENSATED
-                                   ↓
-                          COMPENSATION_FAILED (cần human intervention)
-```
+> Hiểu đơn giản:
+> 
+> - **Definition** = Kịch bản.
+> - **Coordinator** = Người điều khiển.
+> - **Log** = Nhật ký theo dõi.
 
 ---
 
-## 3. Hai biến thể: Choreography vs Orchestration
+## 2.2. Có 3 cách xử lý khi Saga gặp lỗi
 
-Đây là **lựa chọn quan trọng nhất** khi design Saga.
+### 1. Backward Recovery (phổ biến nhất)
 
-### 3.1. Choreography — "Tự biên tự diễn"
-
-> Không có coordinator trung tâm. Mỗi service **lắng nghe event** và **publish event mới** khi xong việc.
-
-#### Sơ đồ flow `Order → Inventory → Payment → Shipping`
-
-```
-OrderService                Kafka              InventoryService    PaymentService    ShippingService
-     |                        |                      |                  |                 |
-     | INSERT order (PENDING) |                      |                  |                 |
-     | publish OrderCreated   |--------------------->| consume          |                 |
-     |                        |                      | reserve stock    |                 |
-     |                        |                      | publish StockReserved             |
-     |                        |<---------------------|                  |                 |
-     |                        |---------------------------------------->| consume         |
-     |                        |                      |                  | charge card     |
-     |                        |                      |                  | publish PaymentCompleted
-     |                        |<---------------------------------------|                  |
-     |                        |--------------------------------------------------------->|
-     |                        |                      |                  |                 | ship
-     |                        |                      |                  |                 | publish OrderShipped
-     |                        |<-----------------------------------------------------------|
-     | consume                |                      |                  |                 |
-     | update order=COMPLETED |                      |                  |                 |
-```
-
-#### Khi có lỗi (ví dụ Payment fail)
-```
-PaymentService publish PaymentFailed
-    ↓
-InventoryService consume PaymentFailed → release stock → publish StockReleased
-    ↓
-OrderService consume StockReleased → update order=CANCELLED
-```
-
-#### Ưu điểm
-- **Loose coupling**: services không biết về nhau, chỉ biết events
-- **Không single point of failure**: không có coordinator
-- **Dễ thêm service mới**: service mới subscribe events, không sửa ai cả
-- **Phù hợp flow đơn giản**: 3-4 bước
-
-#### Nhược điểm
-- **Khó debug, khó trace**: logic flow **không nằm ở đâu cả**, nằm rải rác trong từng consumer
-- **Khó hiểu big picture**: muốn biết toàn flow phải đọc code của tất cả service
-- **Cyclic dependency risk**: A listen B, B listen A → loop dễ xảy ra
-- **Khó implement compensation logic phức tạp**: ai biết bước nào đã chạy, bước nào chưa?
-- **Khó test end-to-end**: phải mock toàn bộ event bus
-
-#### Khi nào dùng Choreography
-- Flow đơn giản (≤ 4 bước)
-- Domain rõ ràng, ít branching
-- Team có culture event-driven mạnh
-- Cần loose coupling tối đa
-- Ví dụ điển hình: user signup flow, order notification
-
-### 3.2. Orchestration — "Có nhạc trưởng"
-
-> Có một **Saga Orchestrator** (thường là một service riêng) điều phối toàn bộ flow. Nó gửi **command** đến các service và nhận **reply**.
-
-#### Sơ đồ flow `Order → Inventory → Payment → Shipping`
-
-```
-                          OrderSagaOrchestrator
-                                  |
-                ┌─────────────────┼──────────────────┬──────────────┐
-                ↓                 ↓                  ↓              ↓
-        OrderService     InventoryService    PaymentService   ShippingService
-```
-
-Flow:
-```
-1. Client → OrderService: createOrder()
-2. OrderService → SagaOrchestrator: start Saga
-3. Orchestrator: state = ORDER_CREATED
-4. Orchestrator → InventoryService: ReserveStockCommand
-5. InventoryService → Orchestrator: StockReservedReply
-6. Orchestrator: state = STOCK_RESERVED
-7. Orchestrator → PaymentService: ChargePaymentCommand
-8. PaymentService → Orchestrator: PaymentCompletedReply (hoặc PaymentFailedReply)
-9. Nếu OK: Orchestrator → ShippingService: ShipOrderCommand
-10. ShippingService → Orchestrator: OrderShippedReply
-11. Orchestrator: state = COMPLETED
-```
-
-#### Khi có lỗi (Payment fail)
-```
-8'. PaymentService → Orchestrator: PaymentFailedReply
-9'. Orchestrator: state = COMPENSATING
-10'. Orchestrator → InventoryService: ReleaseStockCommand
-11'. InventoryService → Orchestrator: StockReleasedReply
-12'. Orchestrator → OrderService: CancelOrderCommand
-13'. Orchestrator: state = COMPENSATED
-```
-
-#### Communication: Command/Reply qua message broker
-
-Orchestrator giao tiếp qua **2 loại message**:
-- **Command** (Orchestrator → Service): "Hãy làm việc X"
-- **Reply** (Service → Orchestrator): "Đã làm xong" / "Đã fail"
-
-Thường dùng Kafka với:
-- Topic `order-saga-commands` (Orchestrator publish)
-- Topic `order-saga-replies` (Services publish)
-
-Hoặc dùng RPC trực tiếp (gRPC) trong một số design.
-
-#### Ưu điểm
-- **Logic tập trung**: muốn hiểu flow → đọc 1 file Orchestrator
-- **Dễ test, dễ trace**: có 1 state machine rõ ràng
-- **Compensation logic rõ ràng**: orchestrator biết đã đến bước nào
-- **Phù hợp flow phức tạp**: nhiều nhánh, nhiều điều kiện
-- **Dễ thêm bước mới**: chỉ sửa Orchestrator
-
-#### Nhược điểm
-- **Single point of failure** (cần HA cho Orchestrator)
-- **Tight coupling logic**: Orchestrator biết về tất cả service
-- **Risk anti-pattern "God service"**: Orchestrator phình to chứa cả business logic
-- **Cần cẩn thận distributed monolith**: Orchestrator + services deploy phải đồng bộ
-
-#### Khi nào dùng Orchestration
-- Flow ≥ 4 bước
-- Có nhiều nhánh điều kiện (if-else, retry, timeout)
-- Compensation logic phức tạp
-- Cần observability cao (audit, monitoring)
-- Ví dụ điển hình: e-commerce checkout, loan application, KYC flow
-
-### 3.3. So sánh trực diện
-
-| Tiêu chí | Choreography | Orchestration |
-|---|---|---|
-| Coordinator | Không có | Có (Orchestrator service) |
-| Coupling | Lỏng (qua events) | Chặt hơn (Orchestrator biết tất) |
-| Big picture | Khó nhìn | Dễ nhìn (1 nơi) |
-| Debug | Khó | Dễ hơn |
-| Phù hợp flow | Đơn giản | Phức tạp |
-| Cyclic risk | Có | Không |
-| Single point of failure | Không | Có (cần HA) |
-| Thêm bước mới | Sửa nhiều service | Sửa Orchestrator |
-| Tooling | Kafka + listeners | + State machine framework |
-| Anti-pattern | Spaghetti events | God service |
-| Test E2E | Khó | Dễ hơn |
-
-### 3.4. Trong thực tế: dùng cả hai
-
-Nhiều hệ thống lớn dùng **hybrid**:
-- Orchestration cho **core flow** (checkout, payment)
-- Choreography cho **side effects** (notification, analytics, audit)
+Nếu một bước thất bại thì **quay ngược lại và chạy các transaction bù**.
 
 Ví dụ:
+
 ```
-Orchestrator quản lý: Order → Inventory → Payment → Shipping
-       ↓ (after COMPLETED, publish event)
-   "OrderCompleted" → NotificationService (choreography)
-                    → AnalyticsService (choreography)
-                    → LoyaltyService (choreography)
+Đặt hàng ✔Giữ hàng ✔Thanh toán ✖→ Trả lại hàng→ Hủy đơn
 ```
 
+Đây là cách hầu hết hệ thống thương mại điện tử sử dụng.
+
 ---
+
+### 2. Forward Recovery
+
+Không quay lại, mà **liên tục retry cho đến khi thành công**.
+
+Ví dụ:
+
+```
+Kê khai thuế ✖→ Retry→ Retry→ Retry→ Thành công
+```
+
+Áp dụng khi **bắt buộc phải hoàn thành**, không thể hủy.
+
+---
+
+### 3. Mixed Recovery
+
+Kết hợp cả hai cách trên.
+
+- Có bước thì rollback bằng compensation.
+- Có bước thì retry đến khi thành công.
+
+Đây là mô hình phổ biến nhất trong các hệ thống thực tế.
+
+## 2.3. Các trạng thái của một Saga
+
+PENDING
+    │
+    ▼
+IN_PROGRESS
+    │
+ ┌──┴───────────┐
+ ▼              ▼
+COMPLETED    FAILED
+                 │
+                 ▼
+          COMPENSATING
+                 │
+        ┌────────┴────────┐
+        ▼                 ▼
+  COMPENSATED   COMPENSATION_FAILED
+                      │
+                Cần người xử lý
+
+
+
+## 3. Hai cách triển khai Saga: Choreography và Orchestration
+
+Khi thiết kế Saga, bạn sẽ phải chọn **một trong hai cách điều phối**:
+
+- **Choreography (Biên đạo: [ˌkɔːr.iˈɑː.ɡrə.fi])** → Không có người điều khiển trung tâm.
+- **Orchestration (Hòa âm: [ˌɔrkəˈstreɪʃən])** → Có một service đứng ra điều phối toàn bộ quy trình.
+
+---
+
+## 3.1. Choreography – Mỗi service tự biết việc của mình
+
+> **Không có Coordinator.** Mỗi service chỉ cần **lắng nghe Event** và khi hoàn thành công việc thì **phát Event mới** để service tiếp theo xử lý.
+
+Ví dụ luồng đặt hàng:
+
+Order
+  │
+  ▼
+OrderCreated Event
+  │
+  ▼
+Inventory giữ hàng
+  │
+  ▼
+StockReserved Event
+  │
+  ▼
+Payment thanh toán
+  │
+  ▼
+PaymentCompleted Event
+  │
+  ▼
+Shipping giao hàng
+
+**Nếu thanh toán thất bại:**
+
+PaymentFailed Event
+        │
+        ▼
+Inventory trả lại hàng
+        │
+        ▼
+Order hủy đơn
+
+Mỗi service chỉ quan tâm **Event** của mình, không cần biết các service khác hoạt động như thế nào.
+
+### Ưu điểm
+
+- Service ít phụ thuộc nhau (Loose Coupling).
+- Dễ mở rộng, chỉ cần thêm service lắng nghe Event.
+- Không có "điểm chết" trung tâm.
+- Phù hợp với các quy trình đơn giản.
+
+### Nhược điểm
+
+- Khó theo dõi toàn bộ luồng xử lý.
+- Debug khó vì logic nằm rải rác ở nhiều service.
+- Compensation phức tạp.
+- Dễ tạo vòng lặp Event nếu thiết kế không cẩn thận.
+
+### Khi nào nên dùng?
+
+- Flow ngắn (khoảng 3–4 bước).
+- Logic đơn giản.
+- Hệ thống sử dụng Event-Driven Architecture.
+
+---
+
+## 3.2. Orchestration – Có một "nhạc trưởng"
+
+> Có một **Saga Orchestrator** đứng giữa, chịu trách nhiệm điều phối toàn bộ quy trình.
+
+Các service không tự quyết định bước tiếp theo mà **chỉ làm theo lệnh của Orchestrator**.
+
+Ví dụ:
+
+Client
+   │
+   ▼
+Saga Orchestrator
+   │
+   ├──► Order Service
+   ├──► Inventory Service
+   ├──► Payment Service
+   └──► Shipping Service
+
+**Luồng xử lý:**
+
+Orchestrator
+      │
+      ▼
+Tạo Order
+      │
+      ▼
+Giữ hàng
+      │
+      ▼
+Thanh toán
+      │
+      ▼
+Giao hàng
+      │
+      ▼
+Hoàn thành
+
+**Nếu Payment thất bại:**
+
+Payment Fail
+      │
+      ▼
+Orchestrator
+      │
+      ├──► Trả lại hàng
+      └──► Hủy đơn
+
+**Luồng xử lý:**
+
+Orchestrator
+      │
+      ▼
+Tạo Order
+      │
+      ▼
+Giữ hàng
+      │
+      ▼
+Thanh toán
+      │
+      ▼
+Giao hàng
+      │
+      ▼
+Hoàn thành
+
+**Nếu Payment thất bại:**
+
+Payment Fail
+      │
+      ▼
+Orchestrator
+      │
+      ├──► Trả lại hàng
+      └──► Hủy đơn
+
+Orchestrator luôn biết quy trình đang ở bước nào và cần làm gì tiếp theo.
+
+### Cách giao tiếp
+
+Orchestrator thường dùng:
+
+- **Command:** Ra lệnh cho service thực hiện công việc.
+- **Reply:** Service phản hồi thành công hoặc thất bại.
+
+Ví dụ:
+
+Orchestrator
+ │
+ChargePaymentCommand
+ │
+ ▼
+Payment Service
+ │
+PaymentCompletedReply
+
+### Ưu điểm
+
+- Toàn bộ luồng xử lý tập trung ở một nơi.
+
+**"Logic tập trung ở 1 nơi" không có nghĩa là các service không có business logic.**
+
+Ý của nó là:
+
+- **Business logic của từng service** vẫn nằm trong service đó.
+- **Business flow (workflow)** của toàn bộ quy trình thì nằm ở Orchestrator.
+
+- Dễ đọc, dễ debug.
+- Compensation rõ ràng.
+- Phù hợp với quy trình nhiều bước và nhiều điều kiện.
+
+### Nhược điểm
+
+- Orchestrator có thể trở thành "điểm chết" nếu không triển khai HA.
+- Dễ trở thành **God Service** nếu nhồi quá nhiều business logic.
+- Orchestrator phải biết về tất cả service.
+
+### Khi nào nên dùng?
+
+- Flow dài (trên 4 bước).
+- Có nhiều điều kiện, retry hoặc timeout.
+- Compensation phức tạp.
+- Cần theo dõi, audit và monitoring chi tiết.
+
+### <mark> Một câu rất hay để ghi nhớ:</mark>
+
+> **Orchestrator quyết định "ai làm tiếp theo", còn mỗi Service quyết định "làm việc đó như thế nào".**
+
+## 3.3. So sánh nhanh
+
+| Choreography              | Orchestration                    |
+| ------------------------- | -------------------------------- |
+| Không có Coordinator      | Có Orchestrator                  |
+| Giao tiếp bằng **Event**  | Giao tiếp bằng **Command/Reply** |
+| Logic nằm ở nhiều service | Logic tập trung một nơi          |
+| Khó debug                 | Dễ debug                         |
+| Dễ mở rộng                | Dễ quản lý quy trình             |
+| Phù hợp flow đơn giản     | Phù hợp flow phức tạp            |
+
+### Ghi nhớ nhanh
+
+- **Choreography** = **Mỗi service tự nghe Event và tự làm việc.**
+- **Orchestration** = **Có một "nhạc trưởng" điều khiển toàn bộ quy trình.**
+
+> **Quy tắc kinh nghiệm:**
+> 
+> - **Flow đơn giản (≤ 4 bước)** → Ưu tiên **Choreography**.
+> - **Flow phức tạp (> 4 bước, nhiều nhánh, nhiều bước bù)** → Ưu tiên **Orchestration**.
 
 ## 4. Saga thực hiện flow của bạn — Thiết kế chi tiết
 
-### 4.1. Flow happy path
+Nếu mọi thứ diễn ra suôn sẻ thì Saga sẽ chạy lần lượt như sau:Chi tiết từng bước:
 
-```
-1. OrderService:
-   - INSERT order (status=PENDING)
-   - Save event "OrderCreated" (outbox - học bài 5)
+Khách đặt hàng
+      │
+      ▼
+Order Service
+(Tạo đơn hàng)
+      │
+      ▼
+Inventory Service
+(Giữ hàng)
+      │
+      ▼
+Payment Service
+(Thanh toán)
+      │
+      ▼
+Shipping Service
+(Tạo đơn giao hàng)
+      │
+      ▼
+Order Service
+(Cập nhật đơn hàng hoàn thành)
 
-2. InventoryService:
-   - Receive command/event "ReserveStock"
-   - UPDATE inventory SET reserved += qty WHERE product_id=X
-   - Save event "StockReserved"
+### Bước 1. Order Service
 
-3. PaymentService:
-   - Receive "ChargePayment"
-   - Call payment gateway → get transaction_id
-   - INSERT payment record
-   - Save event "PaymentCompleted"
+- Tạo đơn hàng.
+- Trạng thái ban đầu là **PENDING**.
+- Gửi Event **OrderCreated**.
 
-4. ShippingService:
-   - Receive "CreateShipment"
-   - INSERT shipment, call carrier API
-   - Save event "ShipmentCreated"
+↓
 
-5. OrderService:
-   - Receive "ShipmentCreated"
-   - UPDATE order SET status=CONFIRMED
-```
+### Bước 2. Inventory Service
 
-### 4.2. Flow lỗi tại Payment (compensation backward)
+- Nhận Event từ Order.
+- Giữ số lượng hàng cần bán.
+- Gửi Event **StockReserved**.
 
-```
-3'. PaymentService:
-    - Call gateway → DECLINED
-    - INSERT payment (status=FAILED)
-    - Save event "PaymentFailed"
+↓
 
-4'. (Compensation) InventoryService:
-    - Receive "ReleaseStock"
-    - UPDATE inventory SET reserved -= qty
-    - Save event "StockReleased"
+### Bước 3. Payment Service
 
-5'. (Compensation) OrderService:
-    - Receive "OrderCancelled"
-    - UPDATE order SET status=CANCELLED
-```
+- Nhận yêu cầu thanh toán.
+- Gọi cổng thanh toán (VNPay, Stripe,...).
+- Nếu thành công thì lưu giao dịch.
+- Gửi Event **PaymentCompleted**.
 
-### 4.3. Phân chia bảng (theo service)
+↓
 
-```
-Order Service DB:
-  - orders (id, customer_id, status, total, created_at)
-  - order_items
-  - outbox_events (sẽ học bài 5)
+### Bước 4. Shipping Service
 
-Inventory Service DB:
-  - products
-  - inventory (product_id, available, reserved)
-  - stock_movements (audit)
+- Tạo đơn giao hàng.
+- Gọi API của đơn vị vận chuyển.
+- Gửi Event **ShipmentCreated**.
 
-Payment Service DB:
-  - payments (id, order_id, amount, status, gateway_txn_id)
-  - payment_attempts
+↓
 
-Shipping Service DB:
-  - shipments (id, order_id, carrier, tracking_no, status)
-```
+### Bước 5. Order Service
 
-### 4.4. Order States (Orchestrator state machine)
+- Nhận Event ShipmentCreated.
+- Cập nhật trạng thái đơn hàng thành **CONFIRMED**.
 
-```
-NEW → STOCK_RESERVING → STOCK_RESERVED 
-                      ↘ STOCK_RESERVE_FAILED → FAILED
+#### Ghi nhớ nhanh
 
-STOCK_RESERVED → PAYMENT_CHARGING → PAYMENT_COMPLETED
-                                 ↘ PAYMENT_FAILED → COMPENSATING_STOCK → CANCELLED
-
-PAYMENT_COMPLETED → SHIPMENT_CREATING → SHIPPED
-                                      ↘ SHIPMENT_FAILED → COMPENSATING_PAYMENT (refund)
-                                                       → COMPENSATING_STOCK
-                                                       → CANCELLED
-
-SHIPPED → COMPLETED (terminal state)
-```
-
----
+- **Happy Path**: Order → Inventory → Payment → Shipping → Hoàn thành.
+- **Payment lỗi**: Trả hàng → Hủy đơn.
+- **Mỗi service có Database riêng**, không truy cập DB của nhau.
+- **Saga hoạt động như một State Machine**, mỗi Event sẽ làm quy trình chuyển sang trạng thái tiếp theo hoặc bắt đầu Compensation khi có lỗi.
 
 ## 5. Implementation trong Spring Boot
 
 ### 5.1. Choreography với Kafka
 
 **OrderService:**
+
 ```java
 @Service
 public class OrderService {
@@ -377,7 +625,7 @@ public class OrderEventListener {
     public void onShipmentCreated(ShipmentCreatedEvent e) {
         orderRepository.updateStatus(e.getOrderId(), "CONFIRMED");
     }
-    
+
     @KafkaListener(topics = "payment-events")
     @Transactional
     public void onPaymentFailed(PaymentFailedEvent e) {
@@ -387,6 +635,7 @@ public class OrderEventListener {
 ```
 
 **InventoryService:**
+
 ```java
 @Component
 public class InventoryEventListener {
@@ -400,7 +649,7 @@ public class InventoryEventListener {
             outboxRepository.save(new OutboxEvent("StockReserveFailed", ...));
         }
     }
-    
+
     @KafkaListener(topics = "payment-events")
     @Transactional
     public void onPaymentFailed(PaymentFailedEvent e) {
@@ -413,12 +662,13 @@ public class InventoryEventListener {
 ### 5.2. Orchestration với State Machine
 
 Cách 1: Tự viết với Spring State Machine
+
 ```java
 @Configuration
 @EnableStateMachineFactory
 public class OrderSagaStateMachine 
     extends EnumStateMachineConfigurerAdapter<OrderState, OrderEvent> {
-    
+
     @Override
     public void configure(StateMachineTransitionConfigurer<OrderState, OrderEvent> t) 
         throws Exception {
@@ -441,27 +691,19 @@ public class OrderSagaStateMachine
 ```
 
 Cách 2: Framework chuyên dụng
+
 - **Axon Framework**: hỗ trợ Saga tốt
 - **Camunda / Zeebe**: BPMN-based, mạnh cho flow phức tạp
 - **Eventuate Tram Sagas**: framework chuyên Saga (của Chris Richardson)
 - **Temporal.io / Cadence**: workflow engine xịn nhất hiện tại, được Uber/Coinbase dùng
 
-### 5.3. Cảnh báo: code mẫu trên CHƯA HOÀN CHỈNH
 
-Có vài vấn đề mà code đơn giản ở trên **bỏ qua**, nhưng production bắt buộc phải xử lý:
-
-1. **Dual Write Problem**: `orderRepository.save()` + `kafkaTemplate.send()` — nếu 1 fail thì sao? → **Outbox Pattern** (bài 5)
-2. **Idempotency**: Kafka at-least-once, message có thể bị deliver nhiều lần → **Idempotent Consumer** (bài 6)
-3. **Ordering**: events đến không đúng thứ tự thì sao? → partition key + version
-4. **Retry & Dead Letter Queue**: khi consumer fail → retry rồi cuối cùng dump vào DLQ
-
-→ Các bài sau sẽ giải quyết từng vấn đề.
 
 ---
 
 ## 6. Khi nào KHÔNG dùng Saga
 
-Saga rất mạnh nhưng không phải bạc đạn. **Không dùng** khi:
+Saga rất mạnh nhưng không phải là nhất. **Không dùng** khi:
 
 1. **Strong consistency là bắt buộc về mặt pháp lý/business**: ví dụ chuyển khoản liên ngân hàng → dùng XA (vâng, banking vẫn dùng 2PC).
 2. **Flow đơn giản, 1 service** → chỉ cần `@Transactional` thường.
@@ -474,44 +716,115 @@ Saga rất mạnh nhưng không phải bạc đạn. **Không dùng** khi:
 ## 7. Bẫy phổ biến
 
 ### Bẫy 1: Không design Compensation từ đầu
+
 Bắt đầu code happy path, rồi mới nghĩ "à phải có compensation". Sai. Saga phải design **cả 2 chiều cùng lúc**.
 
 ### Bẫy 2: Compensation không idempotent
+
 Network retry → compensation chạy 2 lần → trừ kho 2 lần → âm kho. → **Mọi compensation phải idempotent** (bài 6).
 
 ### Bẫy 3: Quên Isolation
+
 Saga **không có Isolation**. Giai đoạn giữa flow, data có thể inconsistent. Ví dụ:
+
 - Order đã tạo (PENDING), stock đã reserve, payment đang xử lý
 - User mở app khác → thấy order "đang xử lý" nhưng stock đã trừ tạm thời
 - Cần design business semantics: "Reserved" stock không hiển thị cho user khác
 
 ### Bẫy 4: God Orchestrator
+
 Orchestrator chứa quá nhiều business logic, trở thành mini-monolith. Quy tắc: **Orchestrator chỉ điều phối, không xử lý business**. Business logic vẫn ở các service.
 
 ### Bẫy 5: Saga timeout
+
 Saga có thể chạy lâu (phút, giờ — Long-running Saga). Cần:
+
 - Timeout cho từng bước
 - Timeout cho toàn Saga
 - Cleanup mechanism (cron job)
 
 ### Bẫy 6: Không có Saga Log
+
 Khi orchestrator crash, restart không biết đang ở bước nào → bí. **Saga Log** lưu trạng thái phải persisted, không phải in-memory.
 
 ### Bẫy 7: Compensation order sai
+
 Phải compensate theo **đúng thứ tự ngược lại** với forward. Compensate "stock" trước "payment" có thể gây lỗi business.
 
 ---
 
 ## 8. Cầu nối tới bài tiếp theo
 
-Bạn đã hiểu Saga ở mức conceptual + skeleton code. Nhưng có 1 vấn đề thực tế **chí mạng** chưa giải:
+Bạn đã hiểu cách Saga hoạt động và cách viết Orchestrator cơ bản. Nhưng vẫn còn một vấn đề rất quan trọng trong thực tế.
 
-> Làm sao để `orderRepository.save()` và `kafkaTemplate.send()` được thực hiện **atomically**?
+> **Làm sao để việc lưu dữ liệu vào Database và gửi Event lên Kafka luôn đồng bộ với nhau?**
 
-Nếu DB save OK mà Kafka send fail → DB có order, không ai biết → Saga ngưng đó.
-Nếu DB save fail mà Kafka đã send → các service khác xử lý 1 order ma → catastrophe.
+Ví dụ trong `OrderService`:
 
-→ Đây là **Dual Write Problem**, và lời giải là **Outbox Pattern** — bài tiếp theo.
+```
+orderRepository.save(order);   // Lưu đơn hàng
+kafkaTemplate.send(...);        // Gửi Event OrderCreated
+```
+
+Hai thao tác này là **2 hệ thống khác nhau**:
+
+- Database
+- Kafka
+
+Vì vậy, chúng **không thể commit cùng lúc** như một transaction ACID.
+
+---
+
+##### Trường hợp 1: Lưu DB thành công, gửi Kafka thất bại
+
+```
+Lưu Order vào DB      ✔Gửi Event lên Kafka   ✖
+```
+
+Kết quả:
+
+- Đơn hàng đã có trong Database.
+- Nhưng không có Event `OrderCreated`.
+- Inventory Service không biết có đơn hàng mới để xử lý.
+
+➡️ Saga sẽ **dừng giữa chừng**.
+
+---
+
+##### Trường hợp 2: Gửi Kafka thành công, lưu DB thất bại
+
+```
+Lưu Order vào DB      ✖Gửi Event lên Kafka   ✔
+```
+
+Kết quả:
+
+- Inventory Service nhận được Event và bắt đầu giữ hàng.
+- Nhưng thực tế trong Database **không hề tồn tại đơn hàng**.
+
+➡️ Các service khác đang xử lý **một đơn hàng "ma"**, dẫn đến dữ liệu sai lệch.
+
+---
+
+##### Đây gọi là Dual Write Problem
+
+**Dual Write Problem** xảy ra khi một service phải **ghi dữ liệu vào hai nơi khác nhau** (ví dụ Database và Kafka), nhưng không thể đảm bảo cả hai đều thành công hoặc đều thất bại cùng lúc.
+
+Đây là một trong những vấn đề phổ biến và nguy hiểm nhất khi xây dựng hệ thống microservices theo Event-Driven Architecture.
+
+---
+
+##### Giải pháp là gì?
+
+Câu trả lời là **Outbox Pattern**.
+
+Thay vì vừa lưu Database vừa gửi Kafka ngay lập tức, hệ thống sẽ:
+
+1. Lưu dữ liệu nghiệp vụ vào Database.
+2. Đồng thời lưu Event vào một bảng **Outbox** trong **cùng transaction**.
+3. Sau đó, một tiến trình riêng sẽ đọc các Event trong Outbox và gửi chúng lên Kafka.
+
+Nhờ vậy, Database và Event luôn được ghi **đồng thời trong một transaction**, tránh hoàn toàn lỗi **Dual Write Problem**.
 
 ---
 
